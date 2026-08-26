@@ -9,8 +9,9 @@ __pycache__/
 venv/
 ENV/
 
-# Logs
+# Logs & Data files
 *.log
+*.csv
 
 # IDE files
 .vscode/
