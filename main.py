@@ -1,5 +1,5 @@
 """
-capital_live_feed.py - Capital.com Dual-Timeframe SMC Strategy Engine
+main.py - Capital.com Dual-Timeframe SMC Strategy Engine
 Maintains deep H4 historical context & live M15 execution structure via .env credentials 
 with reliable plain-text Telegram startup and signal notifications.
 """
@@ -14,7 +14,7 @@ import pandas as pd
 from typing import List
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file
+# Load environment variables from the .env file (ignored by git, loaded securely on Railway)
 load_dotenv()
 
 from models import Candle
@@ -25,7 +25,7 @@ from reversal import find_reversal_entries
 from backtest_demo import extract_htf_zones_from_state
 
 # --- CONFIGURATION ---
-USE_DEMO = False  # Set to True if using a Demo account
+USE_DEMO = False  # Locked to True for your Demo account testing
 
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
 LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
@@ -68,7 +68,7 @@ class CapitalEngine:
         self.latest_tick = {"bid": 0.0, "ask": 0.0}
 
     def authenticate(self):
-        """Authenticates with Capital.com REST API using .env credentials."""
+        """Authenticates with Capital.com REST API using environment credentials."""
         env_type = "DEMO" if USE_DEMO else "LIVE"
         logger.info(f"Authenticating with Capital.com REST API [{env_type} Environment]...")
         auth_url = f"{REST_URL}/session"
@@ -84,7 +84,7 @@ class CapitalEngine:
     def send_telegram_alert(self, message: str):
         """Sends signal alerts and system notifications to Telegram using plain text."""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN == "your_telegram_bot_token_here":
-            logger.warning("[!] Telegram credentials not configured in .env. Skipping notification.")
+            logger.warning("[!] Telegram credentials not configured in environment. Skipping notification.")
             return
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -203,6 +203,9 @@ class CapitalEngine:
             logger.info(f"  Current Bid    : {self.latest_tick['bid']}")
             logger.info("=" * 70)
 
+            # Safe price fallback if WebSocket hasn't ticked yet
+            current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else getattr(latest_signal, 'entry_price', 'N/A')
+
             # Format and fire plain-text Telegram alert
             alert_msg = (
                 f"🚨 US30 SMC SIGNAL DETECTED 🚨\n\n"
@@ -210,7 +213,7 @@ class CapitalEngine:
                 f"🎯 Entry Price: {getattr(latest_signal, 'entry_price', 'N/A')}\n"
                 f"🛑 Stop Loss: {getattr(latest_signal, 'stop_loss', 'N/A')}\n"
                 f"💰 Take Profit: {getattr(latest_signal, 'take_profit', 'N/A')}\n"
-                f"📈 Live Bid: {self.latest_tick['bid']}\n\n"
+                f"📈 Reference Price: {current_price}\n\n"
                 f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             self.send_telegram_alert(alert_msg)
@@ -239,7 +242,7 @@ class CapitalEngine:
         # Send startup Telegram notification
         startup_msg = (
             f"🚀 Capital.com SMC Engine Started\n\n"
-            f"⚙️ Status: Live monitoring active\n"
+            f"⚙️ Status: Live monitoring active (Demo Mode)\n"
             f"📊 Instrument: {EPIC_SYMBOL}\n"
             f"⏱ Boot Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
