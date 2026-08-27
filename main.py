@@ -1,8 +1,7 @@
 """
 main.py - Capital.com Dual-Timeframe SMC Strategy Engine
-Features: Live Production, Risk Management ($10k balance, $1k Max DD, $100 risk),
-Delayed Startup Price Check (1 min via /markets), Immediate Signal Live Price, 
-and 3-Minute Periodic Floating P&L Updates.
+Features: Live Production, Risk Management, Signal Audit Logging (JSON),
+Market-Left-Us / Invalidation Checkers during Spotted State, and Spread/Gap Buffers.
 """
 import os
 import json
@@ -49,6 +48,9 @@ EPIC_SYMBOL = "US30"
 INITIAL_BALANCE = 10000.0
 MAX_DRAWDOWN = 1000.0
 RISK_PER_TRADE = 100.0
+
+# Execution Buffer (Spread & Gap allowance in index points)
+SPREAD_BUFFER = 3.0
 
 # Memory Depths
 LTF_5M_MAX = 1000
@@ -111,6 +113,25 @@ class CapitalEngine:
                 logger.error(f"[-] Failed to send Telegram alert: {res.text}")
         except Exception as e:
             logger.error(f"[-] Telegram network error: {e}")
+
+    def log_signal_to_file(self, sig, live_price: float):
+        """Logs every detected trade signal to a local JSON file for evaluation."""
+        log_entry = {
+            "timestamp": pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "epic": EPIC_SYMBOL,
+            "direction": str(sig.direction).split(".")[-1].upper(),
+            "entry_price": sig.entry_price,
+            "stop_loss": sig.stop_loss,
+            "take_profit": sig.take_profit,
+            "live_price_at_spot": live_price,
+            "rationale": getattr(sig, "rationale", "N/A")
+        }
+        try:
+            with open("signal_history.json", "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+            logger.info("[+] Signal logged successfully to signal_history.json")
+        except Exception as e:
+            logger.error(f"[-] Failed to write signal log: {e}")
 
     def fetch_prices(self, resolution: str, max_bars: int) -> List[Candle]:
         prices_url = f"{REST_URL}/prices/{EPIC_SYMBOL}"
@@ -190,7 +211,7 @@ class CapitalEngine:
         threading.Thread(target=ws.run_forever, name="WebSocketThread", daemon=True).start()
 
     def monitor_active_trade(self, current_price: float):
-        """Monitors entry triggers, 3-minute periodic floating P&L, TP, and SL milestones in real-time."""
+        """Monitors entry triggers, missed setups (market left us), floating P&L, TP, and SL."""
         if self.current_state == TradeState.NO_TRADE:
             return
 
@@ -200,12 +221,71 @@ class CapitalEngine:
         sl = sig.stop_loss
         tp = sig.take_profit
 
-        # 1. Check if SPOTTED order triggers
+        # 1. Check SPOTTED state: Evaluate triggers OR if market left us / invalidated
         if self.current_state == TradeState.SPOTTED:
+            # Check if price action moved away and hit TP or SL before we triggered ("Market Left Us")
+            if direction == "BULLISH":
+                if current_price >= tp:
+                    msg = (
+                        f"⚠️ MARKET LEFT US (BULLISH) ⚠️\n\n"
+                        f"📊 Instrument: {EPIC_SYMBOL}\n"
+                        f"🎯 Target Entry: {entry}\n"
+                        f"🚀 Price reached Take Profit ({tp}) before our limit order could fill!\n"
+                        f"📍 Current Live Price: {current_price}\n\n"
+                        f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    logger.warning("[!] Market left us: TP hit before entry trigger.")
+                    self.send_telegram_alert(msg)
+                    self.current_state = TradeState.NO_TRADE
+                    self.active_signal = None
+                    return
+                elif current_price <= sl:
+                    msg = (
+                        f"❌ SETUP INVALIDATED (SL BREACHED) ❌\n\n"
+                        f"📊 Instrument: {EPIC_SYMBOL}\n"
+                        f"🛑 Stop Loss Level ({sl}) reached before entry ({entry}).\n"
+                        f"📍 Current Live Price: {current_price}\n\n"
+                        f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    logger.info("[-] Setup invalidated: SL hit before entry.")
+                    self.send_telegram_alert(msg)
+                    self.current_state = TradeState.NO_TRADE
+                    self.active_signal = None
+                    return
+            else:  # BEARISH
+                if current_price <= tp:
+                    msg = (
+                        f"⚠️ MARKET LEFT US (BEARISH) ⚠️\n\n"
+                        f"📊 Instrument: {EPIC_SYMBOL}\n"
+                        f"🎯 Target Entry: {entry}\n"
+                        f"🚀 Price reached Take Profit ({tp}) before our limit order could fill!\n"
+                        f"📍 Current Live Price: {current_price}\n\n"
+                        f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    logger.warning("[!] Market left us: TP hit before entry trigger.")
+                    self.send_telegram_alert(msg)
+                    self.current_state = TradeState.NO_TRADE
+                    self.active_signal = None
+                    return
+                elif current_price >= sl:
+                    msg = (
+                        f"❌ SETUP INVALIDATED (SL BREACHED) ❌\n\n"
+                        f"📊 Instrument: {EPIC_SYMBOL}\n"
+                        f"🛑 Stop Loss Level ({sl}) reached before entry ({entry}).\n"
+                        f"📍 Current Live Price: {current_price}\n\n"
+                        f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    logger.info("[-] Setup invalidated: SL hit before entry.")
+                    self.send_telegram_alert(msg)
+                    self.current_state = TradeState.NO_TRADE
+                    self.active_signal = None
+                    return
+
+            # Check if order triggers (with spread/gap buffer allowance)
             triggered = False
-            if direction == "BULLISH" and current_price <= entry:
+            if direction == "BULLISH" and current_price <= (entry + SPREAD_BUFFER):
                 triggered = True
-            elif direction == "BEARISH" and current_price >= entry:
+            elif direction == "BEARISH" and current_price >= (entry - SPREAD_BUFFER):
                 triggered = True
 
             if triggered:
@@ -218,7 +298,7 @@ class CapitalEngine:
                 msg = (
                     f"🟢 ORDER TRIGGERED & ACTIVE 🟢\n\n"
                     f"📊 Instrument: {EPIC_SYMBOL} ({direction})\n"
-                    f"🎯 Filled Price: {current_price}\n"
+                    f"🎯 Filled Price: {current_price} (Buffer: {SPREAD_BUFFER} pts)\n"
                     f"📦 Position Size: {self.position_size} lots\n"
                     f"🛑 Stop Loss: {sl}\n"
                     f"💰 Take Profit: {tp}\n\n"
@@ -342,10 +422,13 @@ class CapitalEngine:
             logger.info(f"  {sig}")
             logger.info("=" * 70)
 
-            # Ensure live market price is fetched immediately (WebSocket or REST snapshot fallback)
+            # Get immediate live price (WebSocket or REST snapshot fallback)
             current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else self.get_live_market_price()
             if current_price == 0.0:
                 current_price = sig.entry_price
+
+            # Log signal to local JSON file for system evaluation
+            self.log_signal_to_file(sig, current_price)
 
             alert_msg = (
                 f"🚨 US30 SMC SIGNAL SPOTTED 🚨\n\n"
@@ -372,7 +455,6 @@ class CapitalEngine:
 
         self.start_websocket()
 
-        # Send immediate startup notification
         startup_msg = (
             f"🚀 Capital.com SMC Engine Started (Live Production)\n\n"
             f"⚙️ Status: Active Monitoring & Risk Engine\n"
@@ -382,7 +464,6 @@ class CapitalEngine:
         )
         self.send_telegram_alert(startup_msg)
 
-        # Background thread to drop the live market price confirmation exactly 1 minute after boot
         def delayed_startup_price_drop():
             time.sleep(60)
             live_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else self.get_live_market_price()
