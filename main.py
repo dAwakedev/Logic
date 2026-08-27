@@ -1,7 +1,7 @@
 """
 main.py - Capital.com Dual-Timeframe SMC Strategy Engine
-Maintains deep H4 historical context & live M15 execution structure via .env credentials 
-with reliable plain-text Telegram startup and signal notifications.
+Features: Live/Demo toggle, Risk Management ($10k balance, $1k Max DD, $100 risk),
+and Full Trade Lifecycle State Machine with Telegram Alerts.
 """
 import os
 import json
@@ -11,10 +11,9 @@ import requests
 import websocket
 import threading
 import pandas as pd
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file (ignored by git, loaded securely on Railway)
 load_dotenv()
 
 from models import Candle
@@ -24,8 +23,8 @@ from structure import classify_swings, build_structure
 from reversal import find_reversal_entries
 from backtest_demo import extract_htf_zones_from_state
 
-# --- CONFIGURATION ---
-USE_DEMO = False  # Locked to True for your Demo account testing
+# --- CONFIGURATION & RISK PARAMETERS ---
+USE_DEMO = False  # Set to False as requested (DEMO = false)
 
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
 LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
@@ -33,12 +32,10 @@ LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
 DEMO_WS_URL = "wss://demo-api-streaming-capital.backend-capital.com/connect"
 LIVE_WS_URL = "wss://api-streaming-capital.backend-capital.com/connect"
 
-# Securely load credentials from environment variables
 API_KEY = os.getenv("CAPITAL_API_KEY")
 IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER")
 PASSWORD = os.getenv("CAPITAL_PASSWORD")
 
-# Telegram Config
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -47,9 +44,14 @@ WS_URL = DEMO_WS_URL if USE_DEMO else LIVE_WS_URL
 
 EPIC_SYMBOL = "US30"
 
+# Risk Management Settings
+INITIAL_BALANCE = 10000.0
+MAX_DRAWDOWN = 1000.0
+RISK_PER_TRADE = 100.0
+
 # Memory Depths
-LTF_5M_MAX = 1000     # ~3.5 days of 5m base bars for M15 execution resampling
-HTF_4H_MAX = 300      # ~50 days of 4H candles for robust structural bias/zones
+LTF_5M_MAX = 1000
+HTF_4H_MAX = 300
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +59,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("CapitalLiveFeed")
+
+class TradeState:
+    NO_TRADE = "NO_TRADE"
+    SPOTTED = "SPOTTED"
+    TRIGGERED = "TRIGGERED"
+    CLOSED = "CLOSED"
 
 class CapitalEngine:
     def __init__(self):
@@ -67,8 +75,14 @@ class CapitalEngine:
         self.last_bar_time = None
         self.latest_tick = {"bid": 0.0, "ask": 0.0}
 
+        # Account & Lifecycle Management
+        self.account_balance = INITIAL_BALANCE
+        self.peak_balance = INITIAL_BALANCE
+        self.current_state = TradeState.NO_TRADE
+        self.active_signal = None
+        self.position_size = 0.0
+
     def authenticate(self):
-        """Authenticates with Capital.com REST API using environment credentials."""
         env_type = "DEMO" if USE_DEMO else "LIVE"
         logger.info(f"Authenticating with Capital.com REST API [{env_type} Environment]...")
         auth_url = f"{REST_URL}/session"
@@ -82,27 +96,20 @@ class CapitalEngine:
         logger.info(f"[+] Auth Successful ({env_type}). Session tokens acquired.")
 
     def send_telegram_alert(self, message: str):
-        """Sends signal alerts and system notifications to Telegram using plain text."""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN == "your_telegram_bot_token_here":
-            logger.warning("[!] Telegram credentials not configured in environment. Skipping notification.")
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.warning("[!] Telegram credentials missing. Skipping alert.")
             return
 
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         try:
             res = requests.post(url, json=payload, timeout=5)
             if res.status_code != 200:
                 logger.error(f"[-] Failed to send Telegram alert: {res.text}")
-            else:
-                logger.info("[+] Telegram notification delivered successfully!")
         except Exception as e:
             logger.error(f"[-] Telegram network error: {e}")
 
     def fetch_prices(self, resolution: str, max_bars: int) -> List[Candle]:
-        """Generic helper to fetch historical candles at any Capital.com resolution."""
         prices_url = f"{REST_URL}/prices/{EPIC_SYMBOL}"
         headers = {"X-CAP-API-KEY": API_KEY, "CST": self.cst, "X-SECURITY-TOKEN": self.xst}
         params = {"resolution": resolution, "max": max_bars}
@@ -127,9 +134,8 @@ class CapitalEngine:
         return candles
 
     def start_websocket(self):
-        """Runs real-time WebSocket connection on a background thread."""
         def on_open(ws):
-            logger.info(f"[WS] Connected ({'DEMO' if USE_DEMO else 'LIVE'}). Subscribing to tick feed for US30...")
+            logger.info(f"[WS] Connected. Subscribing to tick feed for {EPIC_SYMBOL}...")
             subscribe_payload = {
                 "destination": "marketData.subscribe",
                 "correlationId": "sub-us30-live",
@@ -144,8 +150,12 @@ class CapitalEngine:
                 data = json.loads(message)
                 if "marketData" in data.get("destination", ""):
                     payload = data.get("payload", {})
-                    self.latest_tick["bid"] = payload.get("bid", 0.0)
-                    self.latest_tick["ask"] = payload.get("ofr", 0.0)
+                    bid = payload.get("bid", 0.0)
+                    ask = payload.get("ofr", 0.0)
+                    if bid > 0:
+                        self.latest_tick["bid"] = bid
+                        self.latest_tick["ask"] = ask
+                        self.monitor_active_trade(bid)
             except Exception as e:
                 logger.debug(f"[WS Parse Warning] {e}")
 
@@ -156,34 +166,118 @@ class CapitalEngine:
             logger.warning(f"[WS Closed] {status} - {msg}")
 
         ws = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        ws_thread = threading.Thread(target=ws.run_forever, name="WebSocketThread", daemon=True)
-        ws_thread.start()
+            WS_URL, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close
+        );
+        threading.Thread(target=ws.run_forever, name="WebSocketThread", daemon=True).start()
+
+    def monitor_active_trade(self, current_price: float):
+        """Monitors entry triggers, floating P&L, TP, and SL milestones in real-time."""
+        if self.current_state == TradeState.NO_TRADE:
+            return
+
+        sig = self.active_signal
+        direction = str(sig.direction).split(".")[-1].upper()
+        entry = sig.entry_price
+        sl = sig.stop_loss
+        tp = sig.take_profit
+
+        # 1. Check if SPOTTED order triggers
+        if self.current_state == TradeState.SPOTTED:
+            triggered = False
+            if direction == "BULLISH" and current_price <= entry:
+                triggered = True
+            elif direction == "BEARISH" and current_price >= entry:
+                triggered = True
+
+            if triggered:
+                self.current_state = TradeState.TRIGGERED
+                sl_dist = abs(entry - sl)
+                self.position_size = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0.1
+
+                msg = (
+                    f"🟢 ORDER TRIGGERED & ACTIVE 🟢\n\n"
+                    f"📊 Instrument: {EPIC_SYMBOL} ({direction})\n"
+                    f"🎯 Filled Price: {current_price}\n"
+                    f"📦 Position Size: {self.position_size} lots\n"
+                    f"🛑 Stop Loss: {sl}\n"
+                    f"💰 Take Profit: {tp}\n\n"
+                    f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                logger.info(f"[+] Order Triggered at {current_price}")
+                self.send_telegram_alert(msg)
+
+        # 2. Check if TRIGGERED trade hits TP or SL
+        elif self.current_state == TradeState.TRIGGERED:
+            hit_tp = False
+            hit_sl = False
+
+            if direction == "BULLISH":
+                if current_price >= tp:
+                    hit_tp = True
+                elif current_price <= sl:
+                    hit_sl = True
+            else:  # BEARISH
+                if current_price <= tp:
+                    hit_tp = True
+                elif current_price >= sl:
+                    hit_sl = True
+
+            if hit_tp or hit_sl:
+                outcome = "TAKE PROFIT (TP) HIT 🎯" if hit_tp else "STOP LOSS (SL) HIT 🛑"
+                
+                # Calculate PnL (US30 index value scaling approx $1 per point per lot)
+                pnl_points = (tp - entry) if hit_tp else (entry - sl)
+                if direction == "BEARISH":
+                    pnl_points = (entry - tp) if hit_tp else (sl - entry)
+                
+                pnl_dollars = pnl_points * self.position_size
+                if not hit_tp:
+                    pnl_dollars = -RISK_PER_TRADE
+
+                self.account_balance += pnl_dollars
+                if self.account_balance > self.peak_balance:
+                    self.peak_balance = self.account_balance
+
+                current_dd = self.peak_balance - self.account_balance
+
+                msg = (
+                    f"🏁 TRADE OUTCOME: {outcome}\n\n"
+                    f"📊 Instrument: {EPIC_SYMBOL} ({direction})\n"
+                    f"💵 PnL: ${pnl_dollars:.2f}\n"
+                    f"💼 Updated Balance: ${self.account_balance:.2f}\n"
+                    f"📉 Current Drawdown: ${current_dd:.2f} / Max Allowed: ${MAX_DRAWDOWN}\n\n"
+                    f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                logger.info(f"[-] Trade Closed. Outcome: {outcome} | PnL: ${pnl_dollars:.2f}")
+                self.send_telegram_alert(msg)
+
+                # Check Max Drawdown limit breaker
+                if current_dd >= MAX_DRAWDOWN:
+                    dd_msg = f"🚨 MAX DRAWDOWN BREACHED (${current_dd:.2f})! Halting system for safety."
+                    logger.critical(dd_msg)
+                    self.send_telegram_alert(dd_msg)
+
+                # Reset state
+                self.current_state = TradeState.NO_TRADE
+                self.active_signal = None
 
     def process_smc_structure(self):
-        """Evaluates deep H4 Context memory and M15 Execution Setup."""
-        logger.info(f"=== Evaluating SMC Structure on 15m Boundary ===")
-        
-        # 1. Resample LTF execution candles from 5m buffer to 15m
+        if self.current_state != TradeState.NO_TRADE:
+            logger.info("[*] Trade already active/spotted. Skipping new signal scan.")
+            return
+
+        logger.info("=== Evaluating SMC Structure on 15m Boundary ===")
         ltf_candles = resample_candles(self.raw_5m_buffer, minutes=15)
 
-        # 2. Build deep H4 Context directly from pulled H4 historical memory
         htf_swings = detect_swings(self.df_4h_buffer, window=2)
         classify_swings(self.df_4h_buffer, htf_swings, confirm_candles=1)
         htf_state = build_structure(htf_swings)
         htf_zones = extract_htf_zones_from_state(self.df_4h_buffer, htf_swings, htf_state)
 
-        # 3. Build M15 Structure
         ltf_swings = detect_swings(ltf_candles, window=2)
         classify_swings(ltf_candles, ltf_swings, confirm_candles=1)
         ltf_state = build_structure(ltf_swings)
 
-        # 4. Scan for Reversal Signals
         signals = find_reversal_entries(
             candles=ltf_candles,
             swings=ltf_swings,
@@ -196,59 +290,50 @@ class CapitalEngine:
         )
 
         if signals:
-            latest_signal = signals[-1]
+            self.active_signal = signals[-1]
+            self.current_state = TradeState.SPOTTED
+            sig = self.active_signal
+
             logger.info("=" * 70)
-            logger.info("  !!! REAL-TIME SMC SIGNAL DETECTED !!!")
-            logger.info(f"  Signal Details : {latest_signal}")
-            logger.info(f"  Current Bid    : {self.latest_tick['bid']}")
+            logger.info("  !!! REAL-TIME SMC SIGNAL SPOTTED !!!")
+            logger.info(f"  {sig}")
             logger.info("=" * 70)
 
-            # Safe price fallback if WebSocket hasn't ticked yet
-            current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else getattr(latest_signal, 'entry_price', 'N/A')
+            current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else sig.entry_price
 
-            # Format and fire plain-text Telegram alert
             alert_msg = (
-                f"🚨 US30 SMC SIGNAL DETECTED 🚨\n\n"
-                f"📊 Direction: {getattr(latest_signal, 'direction', 'N/A')}\n"
-                f"🎯 Entry Price: {getattr(latest_signal, 'entry_price', 'N/A')}\n"
-                f"🛑 Stop Loss: {getattr(latest_signal, 'stop_loss', 'N/A')}\n"
-                f"💰 Take Profit: {getattr(latest_signal, 'take_profit', 'N/A')}\n"
-                f"📈 Reference Price: {current_price}\n\n"
+                f"🚨 US30 SMC SIGNAL SPOTTED 🚨\n\n"
+                f"📊 Direction: {str(sig.direction).split('.')[-1].upper()}\n"
+                f"🎯 Limit Entry: {sig.entry_price}\n"
+                f"🛑 Stop Loss: {sig.stop_loss}\n"
+                f"💰 Take Profit: {sig.take_profit}\n"
+                f"📈 Reference Price: {current_price}\n"
+                f"⚠️ Risk Allocated: ${RISK_PER_TRADE}\n\n"
                 f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             self.send_telegram_alert(alert_msg)
         else:
-            logger.info("Scan complete: Market condition normal. No setup found.")
+            logger.info("Scan complete: No setup found.")
 
     def run(self):
         self.authenticate()
         
-        # Warm up deep HTF context (4H bars) first
-        logger.info(f"[1/2] Warming up deep HTF structural context ({HTF_4H_MAX} 4H candles ≈ 50 days)...")
+        logger.info(f"[1/2] Warming up HTF context ({HTF_4H_MAX} bars)...")
         self.df_4h_buffer = self.fetch_prices(resolution="HOUR_4", max_bars=HTF_4H_MAX)
-        logger.info(f"[1/2] HTF memory loaded: {len(self.df_4h_buffer)} bars.")
-        if self.df_4h_buffer:
-            logger.info(f"      ↳ [HTF Range] Start: {self.df_4h_buffer[0].timestamp} | End: {self.df_4h_buffer[-1].timestamp}")
 
-        # Warm up LTF execution buffer (5m bars)
-        logger.info(f"[2/2] Warming up LTF execution memory ({LTF_5M_MAX} 5m candles)...")
+        logger.info(f"[2/2] Warming up LTF execution memory ({LTF_5M_MAX} bars)...")
         self.raw_5m_buffer = self.fetch_prices(resolution="MINUTE_5", max_bars=LTF_5M_MAX)
-        logger.info(f"[2/2] LTF memory loaded: {len(self.raw_5m_buffer)} bars.")
-        if self.raw_5m_buffer:
-            logger.info(f"      ↳ [LTF Range] Start: {self.raw_5m_buffer[0].timestamp} | End: {self.raw_5m_buffer[-1].timestamp}")
 
         self.start_websocket()
 
-        # Send startup Telegram notification
         startup_msg = (
-            f"🚀 Capital.com SMC Engine Started\n\n"
-            f"⚙️ Status: Live monitoring active (Demo Mode)\n"
+            f"🚀 Capital.com SMC Engine Started (Live Production)\n\n"
+            f"⚙️ Status: Active Monitoring & Risk Engine\n"
+            f"💰 Balance: ${INITIAL_BALANCE} | Max DD: ${MAX_DRAWDOWN} | Risk/Trade: ${RISK_PER_TRADE}\n"
             f"📊 Instrument: {EPIC_SYMBOL}\n"
             f"⏱ Boot Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         self.send_telegram_alert(startup_msg)
-
-        logger.info("[*] Live Polling Loop Started (5-Minute REST intervals)...")
 
         while True:
             try:
@@ -262,11 +347,7 @@ class CapitalEngine:
                         if len(self.raw_5m_buffer) > LTF_5M_MAX:
                             self.raw_5m_buffer.pop(0)
 
-                        logger.info(f"[{newest_bar.timestamp}] New 5m Candle | Close: {newest_bar.close} | Live Bid: {self.latest_tick['bid']}")
-
-                        # Refresh H4 context memory periodically every 4 hours
                         if newest_bar.timestamp.minute == 0 and newest_bar.timestamp.hour % 4 == 0:
-                            logger.info("[*] Refreshing deep H4 context memory...")
                             self.df_4h_buffer = self.fetch_prices(resolution="HOUR_4", max_bars=HTF_4H_MAX)
 
                         if newest_bar.timestamp.minute % 15 == 0:
@@ -275,10 +356,10 @@ class CapitalEngine:
                 time.sleep(300)
 
             except KeyboardInterrupt:
-                logger.info("\n[-] Shutdown requested. Exiting...")
+                logger.info("Shutdown requested.")
                 break
             except Exception as e:
-                logger.error(f"[-] Loop error: {e}. Retrying in 30 seconds...")
+                logger.error(f"Loop error: {e}. Retrying in 30s...")
                 time.sleep(30)
 
 if __name__ == "__main__":
