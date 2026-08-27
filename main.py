@@ -1,7 +1,7 @@
 """
 main.py - Capital.com Dual-Timeframe SMC Strategy Engine
-Features: Live/Demo toggle, Risk Management ($10k balance, $1k Max DD, $100 risk),
-and Full Trade Lifecycle State Machine with Telegram Alerts.
+Features: Live Production, Risk Management ($10k balance, $1k Max DD, $100 risk),
+Delayed Startup Price Check (1 min), Immediate Signal Live Price, and 3-Minute Periodic Floating P&L Updates.
 """
 import os
 import json
@@ -24,7 +24,7 @@ from reversal import find_reversal_entries
 from backtest_demo import extract_htf_zones_from_state
 
 # --- CONFIGURATION & RISK PARAMETERS ---
-USE_DEMO = False  # Set to False as requested (DEMO = false)
+USE_DEMO = False  # DEMO = false as requested
 
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
 LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
@@ -81,6 +81,8 @@ class CapitalEngine:
         self.current_state = TradeState.NO_TRADE
         self.active_signal = None
         self.position_size = 0.0
+        self.filled_price = 0.0
+        self.last_floating_alert_time = 0.0  # Controls 3-minute periodic updates
 
     def authenticate(self):
         env_type = "DEMO" if USE_DEMO else "LIVE"
@@ -133,6 +135,16 @@ class CapitalEngine:
 
         return candles
 
+    def get_live_market_price(self) -> float:
+        """Helper to fetch a fresh current market price via REST if WebSocket tick is pending."""
+        try:
+            bars = self.fetch_prices(resolution="MINUTE_1", max_bars=1)
+            if bars:
+                return bars[-1].close
+        except Exception as e:
+            logger.debug(f"[-] Failed to fetch REST price fallback: {e}")
+        return 0.0
+
     def start_websocket(self):
         def on_open(ws):
             logger.info(f"[WS] Connected. Subscribing to tick feed for {EPIC_SYMBOL}...")
@@ -167,11 +179,11 @@ class CapitalEngine:
 
         ws = websocket.WebSocketApp(
             WS_URL, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close
-        );
+        )
         threading.Thread(target=ws.run_forever, name="WebSocketThread", daemon=True).start()
 
     def monitor_active_trade(self, current_price: float):
-        """Monitors entry triggers, floating P&L, TP, and SL milestones in real-time."""
+        """Monitors entry triggers, 3-minute periodic floating P&L, TP, and SL milestones in real-time."""
         if self.current_state == TradeState.NO_TRADE:
             return
 
@@ -191,8 +203,10 @@ class CapitalEngine:
 
             if triggered:
                 self.current_state = TradeState.TRIGGERED
+                self.filled_price = current_price
                 sl_dist = abs(entry - sl)
                 self.position_size = round(RISK_PER_TRADE / sl_dist, 2) if sl_dist > 0 else 0.1
+                self.last_floating_alert_time = time.time()  # Reset timer for periodic updates
 
                 msg = (
                     f"🟢 ORDER TRIGGERED & ACTIVE 🟢\n\n"
@@ -206,8 +220,33 @@ class CapitalEngine:
                 logger.info(f"[+] Order Triggered at {current_price}")
                 self.send_telegram_alert(msg)
 
-        # 2. Check if TRIGGERED trade hits TP or SL
+        # 2. Check if TRIGGERED trade hits TP/SL or needs a 3-minute periodic floating update
         elif self.current_state == TradeState.TRIGGERED:
+            # Check for 3-minute periodic floating update (180 seconds)
+            now = time.time()
+            if now - self.last_floating_alert_time >= 180:
+                self.last_floating_alert_time = now
+
+                if direction == "BULLISH":
+                    pnl_pts = current_price - self.filled_price
+                else:
+                    pnl_pts = self.filled_price - current_price
+
+                pnl_usd = pnl_pts * self.position_size
+
+                floating_msg = (
+                    f"📊 FLOATING TRADE UPDATE (3 MIN) 📊\n\n"
+                    f"📈 Instrument: {EPIC_SYMBOL} ({direction})\n"
+                    f"📍 Current Live Price: {current_price}\n"
+                    f"🎯 Entry Price: {self.filled_price}\n"
+                    f"💵 Floating P&L: ${pnl_usd:.2f} ({pnl_pts:+.1f} pts)\n"
+                    f"🛑 Stop Loss: {sl} | 💰 Take Profit: {tp}\n\n"
+                    f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                logger.info(f"[*] Floating Update (3m) | Price: {current_price} | PnL: ${pnl_usd:.2f}")
+                self.send_telegram_alert(floating_msg)
+
+            # Check outcome conditions
             hit_tp = False
             hit_sl = False
 
@@ -225,7 +264,6 @@ class CapitalEngine:
             if hit_tp or hit_sl:
                 outcome = "TAKE PROFIT (TP) HIT 🎯" if hit_tp else "STOP LOSS (SL) HIT 🛑"
                 
-                # Calculate PnL (US30 index value scaling approx $1 per point per lot)
                 pnl_points = (tp - entry) if hit_tp else (entry - sl)
                 if direction == "BEARISH":
                     pnl_points = (entry - tp) if hit_tp else (sl - entry)
@@ -243,7 +281,7 @@ class CapitalEngine:
                 msg = (
                     f"🏁 TRADE OUTCOME: {outcome}\n\n"
                     f"📊 Instrument: {EPIC_SYMBOL} ({direction})\n"
-                    f"💵 PnL: ${pnl_dollars:.2f}\n"
+                    f"💵 Final PnL: ${pnl_dollars:.2f}\n"
                     f"💼 Updated Balance: ${self.account_balance:.2f}\n"
                     f"📉 Current Drawdown: ${current_dd:.2f} / Max Allowed: ${MAX_DRAWDOWN}\n\n"
                     f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -251,13 +289,11 @@ class CapitalEngine:
                 logger.info(f"[-] Trade Closed. Outcome: {outcome} | PnL: ${pnl_dollars:.2f}")
                 self.send_telegram_alert(msg)
 
-                # Check Max Drawdown limit breaker
                 if current_dd >= MAX_DRAWDOWN:
                     dd_msg = f"🚨 MAX DRAWDOWN BREACHED (${current_dd:.2f})! Halting system for safety."
                     logger.critical(dd_msg)
                     self.send_telegram_alert(dd_msg)
 
-                # Reset state
                 self.current_state = TradeState.NO_TRADE
                 self.active_signal = None
 
@@ -299,7 +335,10 @@ class CapitalEngine:
             logger.info(f"  {sig}")
             logger.info("=" * 70)
 
-            current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else sig.entry_price
+            # Ensure live market price is fetched immediately (WebSocket or REST fallback)
+            current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else self.get_live_market_price()
+            if current_price == 0.0:
+                current_price = sig.entry_price
 
             alert_msg = (
                 f"🚨 US30 SMC SIGNAL SPOTTED 🚨\n\n"
@@ -307,7 +346,7 @@ class CapitalEngine:
                 f"🎯 Limit Entry: {sig.entry_price}\n"
                 f"🛑 Stop Loss: {sig.stop_loss}\n"
                 f"💰 Take Profit: {sig.take_profit}\n"
-                f"📈 Reference Price: {current_price}\n"
+                f"📈 Live Market Price: {current_price}\n"
                 f"⚠️ Risk Allocated: ${RISK_PER_TRADE}\n\n"
                 f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
@@ -326,6 +365,7 @@ class CapitalEngine:
 
         self.start_websocket()
 
+        # Send immediate startup notification
         startup_msg = (
             f"🚀 Capital.com SMC Engine Started (Live Production)\n\n"
             f"⚙️ Status: Active Monitoring & Risk Engine\n"
@@ -334,6 +374,20 @@ class CapitalEngine:
             f"⏱ Boot Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         self.send_telegram_alert(startup_msg)
+
+        # Background thread to drop the live market price confirmation exactly 1 minute after boot
+        def delayed_startup_price_drop():
+            time.sleep(60)
+            live_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else self.get_live_market_price()
+            price_msg = (
+                f"📈 MARKET PRICE TICK (POST-BOOT)\n\n"
+                f"📊 Instrument: {EPIC_SYMBOL}\n"
+                f"📍 Current Live Price: {live_price}\n"
+                f"⏱ Time: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            self.send_telegram_alert(price_msg)
+
+        threading.Thread(target=delayed_startup_price_drop, name="StartupPriceThread", daemon=True).start()
 
         while True:
             try:
@@ -359,7 +413,7 @@ class CapitalEngine:
                 logger.info("Shutdown requested.")
                 break
             except Exception as e:
-                logger.error(f"Loop error: {e}. Retrying in 30s...")
+                logger.error(f"Loop error: {e}. Retrying in 30scharts...")
                 time.sleep(30)
 
 if __name__ == "__main__":
