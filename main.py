@@ -1,7 +1,8 @@
 """
 main.py - Capital.com Dual-Timeframe SMC Strategy Engine
 Features: Live Production, Risk Management ($10k balance, $1k Max DD, $100 risk),
-Delayed Startup Price Check (1 min), Immediate Signal Live Price, and 3-Minute Periodic Floating P&L Updates.
+Delayed Startup Price Check (1 min via /markets), Immediate Signal Live Price, 
+and 3-Minute Periodic Floating P&L Updates.
 """
 import os
 import json
@@ -136,13 +137,19 @@ class CapitalEngine:
         return candles
 
     def get_live_market_price(self) -> float:
-        """Helper to fetch a fresh current market price via REST if WebSocket tick is pending."""
+        """Helper to fetch a fresh current market price instantly via the /markets snapshot endpoint."""
+        market_url = f"{REST_URL}/markets/{EPIC_SYMBOL}"
+        headers = {"X-CAP-API-KEY": API_KEY, "CST": self.cst, "X-SECURITY-TOKEN": self.xst}
         try:
-            bars = self.fetch_prices(resolution="MINUTE_1", max_bars=1)
-            if bars:
-                return bars[-1].close
+            res = requests.get(market_url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                snapshot = data.get("snapshot", {})
+                bid = float(snapshot.get("bid", 0.0))
+                if bid > 0:
+                    return bid
         except Exception as e:
-            logger.debug(f"[-] Failed to fetch REST price fallback: {e}")
+            logger.debug(f"[-] Failed to fetch market snapshot price: {e}")
         return 0.0
 
     def start_websocket(self):
@@ -335,7 +342,7 @@ class CapitalEngine:
             logger.info(f"  {sig}")
             logger.info("=" * 70)
 
-            # Ensure live market price is fetched immediately (WebSocket or REST fallback)
+            # Ensure live market price is fetched immediately (WebSocket or REST snapshot fallback)
             current_price = self.latest_tick['bid'] if self.latest_tick['bid'] > 0 else self.get_live_market_price()
             if current_price == 0.0:
                 current_price = sig.entry_price
@@ -413,7 +420,7 @@ class CapitalEngine:
                 logger.info("Shutdown requested.")
                 break
             except Exception as e:
-                logger.error(f"Loop error: {e}. Retrying in 30scharts...")
+                logger.error(f"Loop error: {e}. Retrying in 30s...")
                 time.sleep(30)
 
 if __name__ == "__main__":
